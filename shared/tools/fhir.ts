@@ -21,7 +21,7 @@ const FHIR_TIMEOUT_MS = 15_000;
 
 // ── Internal helpers ───────────────────────────────────────────────────────────
 
-interface FhirCredentials {
+export interface FhirCredentials {
     fhirUrl: string;
     fhirToken: string;
     patientId: string;
@@ -31,20 +31,21 @@ const NO_CREDS_RESPONSE = {
     status: 'error',
     error_message:
         "FHIR context is not available. Ensure the caller includes 'fhir-context' " +
-        'in the A2A message metadata (fhirUrl, fhirToken, patientId).',
+        'in the A2A message metadata (fhirUrl and patientId). fhirToken may be empty for open servers.',
 };
 
-function getFhirCredentials(toolContext: ToolContext): FhirCredentials | null {
+export function getFhirCredentials(toolContext: ToolContext): FhirCredentials | null {
     // Accept both camelCase (TypeScript) and snake_case (Python) key names.
     const fhirUrl = (toolContext.state.get('fhirUrl') ?? toolContext.state.get('fhir_url')) as string | undefined;
-    const fhirToken = (toolContext.state.get('fhirToken') ?? toolContext.state.get('fhir_token')) as string | undefined;
+    const fhirTokenRaw = (toolContext.state.get('fhirToken') ?? toolContext.state.get('fhir_token')) as string | undefined;
     const patientId = (toolContext.state.get('patientId') ?? toolContext.state.get('patient_id')) as string | undefined;
 
-    if (!fhirUrl || !fhirToken || !patientId) return null;
-    return { fhirUrl: fhirUrl.replace(/\/$/, ''), fhirToken, patientId };
+    if (!fhirUrl?.trim() || !patientId?.trim()) return null;
+    const fhirToken = (fhirTokenRaw ?? '').trim();
+    return { fhirUrl: fhirUrl.replace(/\/$/, ''), fhirToken, patientId: patientId.trim() };
 }
 
-async function fhirGet(
+export async function fhirGet(
     creds: FhirCredentials,
     path: string,
     params?: Record<string, string>,
@@ -56,18 +57,57 @@ async function fhirGet(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), FHIR_TIMEOUT_MS);
     try {
+        const headers: Record<string, string> = { Accept: 'application/fhir+json' };
+        if (creds.fhirToken.length > 0) {
+            headers.Authorization = `Bearer ${creds.fhirToken}`;
+        }
         const response = await fetch(url.toString(), {
             signal: controller.signal,
-            headers: {
-                Authorization: `Bearer ${creds.fhirToken}`,
-                Accept: 'application/fhir+json',
-            },
+            headers,
         });
         if (!response.ok) {
             const body = await response.text().catch(() => '');
             throw new Error(`FHIR HTTP ${response.status}: ${body.slice(0, 200)}`);
         }
         return response.json() as Promise<Record<string, unknown>>;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/** POST a FHIR resource (e.g. create Appointment). */
+export async function fhirPost(
+    creds: FhirCredentials,
+    path: string,
+    body: unknown,
+): Promise<Record<string, unknown>> {
+    const url = new URL(`${creds.fhirUrl}/${path.replace(/^\//, '')}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FHIR_TIMEOUT_MS);
+    try {
+        const headers: Record<string, string> = {
+            Accept: 'application/fhir+json',
+            'Content-Type': 'application/fhir+json',
+        };
+        if (creds.fhirToken.length > 0) {
+            headers.Authorization = `Bearer ${creds.fhirToken}`;
+        }
+        const response = await fetch(url.toString(), {
+            method: 'POST',
+            signal: controller.signal,
+            headers,
+            body: JSON.stringify(body),
+        });
+        const text = await response.text().catch(() => '');
+        if (!response.ok) {
+            throw new Error(`FHIR HTTP ${response.status}: ${text.slice(0, 200)}`);
+        }
+        if (!text) return { status: response.status };
+        try {
+            return JSON.parse(text) as Record<string, unknown>;
+        } catch {
+            return { raw: text };
+        }
     } finally {
         clearTimeout(timer);
     }
@@ -526,6 +566,380 @@ export const getGoals = new FunctionTool({
             return { status: 'success', patient_id: creds.patientId, count: goals.length, goals };
         } catch (err) {
             console.error(`tool_get_goals_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: medication requests ──────────────────────────────────────────────────
+
+export const getMedicationRequests = new FunctionTool({
+    name: 'getMedicationRequests',
+    description:
+        "Retrieves the patient's active medication requests (prescriptions) from the FHIR server. " +
+        'Returns medication names, dosage instructions, and prescribing dates. ' +
+        'No arguments required.',
+    parameters: z.object({}),
+    execute: async (_input: unknown, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_medication_requests patient_id=${creds.patientId}`);
+        try {
+            const bundle = await fhirGet(creds, 'MedicationRequest', {
+                patient: creds.patientId, status: 'active', _count: '50',
+            }) as Record<string, unknown>;
+
+            const medications = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const medConcept = (res['medicationCodeableConcept'] as Record<string, unknown> | undefined) ?? {};
+                const medName = (medConcept['text'] as string | undefined)
+                    ?? codingDisplay((medConcept['coding'] as unknown[] | undefined) ?? [])
+                    ?? ((res['medicationReference'] as Record<string, string> | undefined) ?? {})['display']
+                    ?? 'Unknown';
+                const dosageList = ((res['dosageInstruction'] as unknown[] | undefined) ?? [])
+                    .map((d: unknown) => (d as Record<string, string>)['text'] ?? 'No dosage text');
+                return {
+                    medication: medName,
+                    status: res['status'],
+                    dosage: dosageList[0] ?? 'Not specified',
+                    authored_on: res['authoredOn'],
+                    requester: ((res['requester'] as Record<string, string> | undefined) ?? {})['display'],
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: medications.length, medication_requests: medications };
+        } catch (err) {
+            console.error(`tool_get_medication_requests_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: medication statements ────────────────────────────────────────────────
+
+export const getMedicationStatements = new FunctionTool({
+    name: 'getMedicationStatements',
+    description:
+        "Retrieves the patient's active medication statements (pre-admission meds) from the FHIR server. " +
+        'Returns medication names, dosage instructions, and prescribing dates. ' +
+        'No arguments required.',
+    parameters: z.object({}),
+    execute: async (_input: unknown, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_medication_statements patient_id=${creds.patientId}`);
+        try {
+            const bundle = await fhirGet(creds, 'MedicationStatement', {
+                patient: creds.patientId, status: 'active', _count: '50',
+            }) as Record<string, unknown>;
+
+            const medications = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const medConcept = (res['medicationCodeableConcept'] as Record<string, unknown> | undefined) ?? {};
+                const medName = (medConcept['text'] as string | undefined)
+                    ?? codingDisplay((medConcept['coding'] as unknown[] | undefined) ?? [])
+                    ?? ((res['medicationReference'] as Record<string, string> | undefined) ?? {})['display']
+                    ?? 'Unknown';
+                const dosageList = ((res['dosage'] as unknown[] | undefined) ?? [])
+                    .map((d: unknown) => (d as Record<string, string>)['text'] ?? 'No dosage text');
+                return {
+                    medication: medName,
+                    status: res['status'],
+                    dosage: dosageList[0] ?? 'Not specified',
+                    effective_date: (res['effectiveDateTime'] as string | undefined) ?? null,
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: medications.length, medication_statements: medications };
+        } catch (err) {
+            console.error(`tool_get_medication_statements_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: allergy intolerances ─────────────────────────────────────────────────
+
+export const getAllergyIntolerances = new FunctionTool({
+    name: 'getAllergyIntolerances',
+    description:
+        "Retrieves the patient's known drug allergies and intolerances from the FHIR server. " +
+        'Returns allergy names, clinical status, and criticality. ' +
+        'No arguments required.',
+    parameters: z.object({}),
+    execute: async (_input: unknown, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_allergy_intolerances patient_id=${creds.patientId}`);
+        try {
+            const bundle = await fhirGet(creds, 'AllergyIntolerance', {
+                patient: creds.patientId,
+            }) as Record<string, unknown>;
+
+            const allergies = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const codeConcept = (res['code'] as Record<string, unknown> | undefined) ?? {};
+                const codeName = (codeConcept['text'] as string | undefined)
+                    ?? codingDisplay((codeConcept['coding'] as unknown[] | undefined) ?? [])
+                    ?? 'Unknown';
+                const clinicalStatus = ((res['clinicalStatus'] as Record<string, unknown> | undefined) ?? {})['coding'] as unknown[] | undefined;
+                return {
+                    allergy: codeName,
+                    clinical_status: clinicalStatus?.[0] ? (clinicalStatus[0] as Record<string, string>)['code'] : null,
+                    criticality: res['criticality'] ?? null,
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: allergies.length, allergies };
+        } catch (err) {
+            console.error(`tool_get_allergy_intolerances_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: encounters ───────────────────────────────────────────────────────────
+
+export const getEncounters = new FunctionTool({
+    name: 'getEncounters',
+    description:
+        "Retrieves the patient's encounter (admission) history from the FHIR server. " +
+        'Returns encounter types, start/end dates, and reasons. ' +
+        'No arguments required.',
+    parameters: z.object({}),
+    execute: async (_input: unknown, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_encounters patient_id=${creds.patientId}`);
+        try {
+            const bundle = await fhirGet(creds, 'Encounter', {
+                patient: creds.patientId, _sort: '-date', _count: '10',
+            }) as Record<string, unknown>;
+
+            const encounters = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const classCode = (res['class'] as Record<string, unknown> | undefined) ?? {};
+                const typeCodings = (((res['type'] as unknown[] | undefined) ?? [])[0] as Record<string, unknown> | undefined) ?? {};
+                const typeName = (typeCodings['text'] as string | undefined) ?? codingDisplay((typeCodings['coding'] as unknown[] | undefined) ?? []);
+                const period = (res['period'] as Record<string, string> | undefined) ?? {};
+                
+                return {
+                    id: res['id'],
+                    status: res['status'],
+                    class: classCode['code'] ?? null,
+                    type: typeName || null,
+                    period_start: period['start'] ?? null,
+                    period_end: period['end'] ?? null,
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: encounters.length, encounters };
+        } catch (err) {
+            console.error(`tool_get_encounters_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: appointments ─────────────────────────────────────────────────────────
+
+export const getAppointments = new FunctionTool({
+    name: 'getAppointments',
+    description:
+        "Retrieves the patient's upcoming appointments from the FHIR server. " +
+        'Returns appointment dates, status, and participants. ' +
+        'No arguments required.',
+    parameters: z.object({}),
+    execute: async (_input: unknown, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_appointments patient_id=${creds.patientId}`);
+        try {
+            const today = new Date().toISOString().split('T')[0];
+            const bundle = await fhirGet(creds, 'Appointment', {
+                patient: creds.patientId, date: `ge${today}`,
+            }) as Record<string, unknown>;
+
+            const appointments = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const participants = ((res['participant'] as unknown[] | undefined) ?? []).map((p: unknown) => {
+                    const part = p as Record<string, unknown>;
+                    const actor = (part['actor'] as Record<string, string> | undefined) ?? {};
+                    return {
+                        actor: actor['display'] ?? actor['reference'] ?? 'Unknown',
+                        status: part['status'],
+                    };
+                });
+                
+                return {
+                    id: res['id'],
+                    status: res['status'],
+                    description: res['description'] ?? null,
+                    start: res['start'] ?? null,
+                    end: res['end'] ?? null,
+                    participants,
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: appointments.length, appointments };
+        } catch (err) {
+            console.error(`tool_get_appointments_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: observations by code ─────────────────────────────────────────────────
+
+export const getObservationsByCode = new FunctionTool({
+    name: 'getObservationsByCode',
+    description:
+        "Retrieves specific lab results or observations by LOINC code. " +
+        "Returns the most recent observations matching the provided code.",
+    parameters: z.object({
+        code: z.string().describe("The LOINC code of the observation to retrieve (e.g. '4548-4' for HbA1c).")
+    }),
+    execute: async (input: { code: string }, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        console.info(`tool_get_observations_by_code patient_id=${creds.patientId} code=${input.code}`);
+        try {
+            const bundle = await fhirGet(creds, 'Observation', {
+                patient: creds.patientId, code: input.code, _sort: '-date',
+            }) as Record<string, unknown>;
+
+            const observations = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const code = (res['code'] as Record<string, unknown> | undefined) ?? {};
+                const obsName = (code['text'] as string | undefined) ?? codingDisplay((code['coding'] as unknown[] | undefined) ?? []);
+
+                let value: unknown = null;
+                let unit: string | null = null;
+                if ('valueQuantity' in res) {
+                    const vq = res['valueQuantity'] as Record<string, unknown>;
+                    value = vq['value'];
+                    unit = (vq['unit'] ?? vq['code']) as string | null;
+                }
+
+                const effective = (res['effectiveDateTime'] as string | undefined)
+                    ?? ((res['effectivePeriod'] as Record<string, string> | undefined) ?? {})['start'];
+
+                return {
+                    observation: obsName,
+                    value,
+                    unit,
+                    effective_date: effective ?? null,
+                    status: res['status'],
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, code: input.code, count: observations.length, observations };
+        } catch (err) {
+            console.error(`tool_get_observations_by_code_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: medication dispenses (fills) ─────────────────────────────────────────
+
+export const getMedicationDispenses = new FunctionTool({
+    name: 'getMedicationDispenses',
+    description:
+        "Retrieves recent MedicationDispense resources for the patient (pharmacy fills). " +
+        'Newest first. Use with MedicationRequest to detect missing fills after discharge.',
+    parameters: z.object({
+        _count: z.string().optional().describe('Max rows, default 50'),
+    }),
+    execute: async (input: { _count?: string }, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        const count = input._count ?? '50';
+        console.info(`tool_get_medication_dispenses patient_id=${creds.patientId}`);
+        try {
+            const bundle = await fhirGet(creds, 'MedicationDispense', {
+                patient: creds.patientId,
+                _sort: '-date',
+                _count: count,
+            }) as Record<string, unknown>;
+
+            const rows = ((bundle['entry'] as unknown[] | undefined) ?? []).map((entry: unknown) => {
+                const res = (entry as Record<string, unknown>)['resource'] as Record<string, unknown>;
+                const medConcept =
+                    (res['medicationCodeableConcept'] as Record<string, unknown> | undefined) ?? {};
+                const medName =
+                    (medConcept['text'] as string | undefined) ??
+                    codingDisplay((medConcept['coding'] as unknown[] | undefined) ?? []) ??
+                    'Unknown';
+                const when = (res['whenHandedOver'] as string | undefined)
+                    ?? (res['whenPrepared'] as string | undefined)
+                    ?? null;
+                const authRef = (res['authorizingPrescription'] as unknown[] | undefined)?.[0] as
+                    | Record<string, string>
+                    | undefined;
+                return {
+                    medication: medName,
+                    when_handed_over: when,
+                    status: res['status'] ?? null,
+                    authorizing_prescription: authRef?.['reference'] ?? authRef?.['display'] ?? null,
+                };
+            });
+
+            return { status: 'success', patient_id: creds.patientId, count: rows.length, dispenses: rows };
+        } catch (err) {
+            console.error(`tool_get_medication_dispenses_error: ${String(err)}`);
+            return { status: 'error', error_message: String(err) };
+        }
+    },
+});
+
+// ── Tool: practitioner ─────────────────────────────────────────────────────────
+
+export const getPractitioner = new FunctionTool({
+    name: 'getPractitioner',
+    description: 'Fetches a Practitioner resource by id (e.g. from Appointment.participant actor reference).',
+    parameters: z.object({
+        practitionerId: z.string().describe('FHIR Practitioner logical id (not a full reference)'),
+    }),
+    execute: async (input: { practitionerId: string }, toolContext?: ToolContext) => {
+        if (!toolContext) return NO_CREDS_RESPONSE;
+        const creds = getFhirCredentials(toolContext);
+        if (!creds) return NO_CREDS_RESPONSE;
+
+        const id = input.practitionerId.replace(/^Practitioner\//, '');
+        console.info(`tool_get_practitioner id=${id}`);
+        try {
+            const res = await fhirGet(creds, `Practitioner/${id}`) as Record<string, unknown>;
+            const names = (res['name'] as unknown[] | undefined) ?? [];
+            const official = (
+                (names.find((n: unknown) => (n as Record<string, string>)['use'] === 'official') ??
+                    names[0]) ?? {}
+            ) as Record<string, unknown>;
+            const given = ((official['given'] as string[] | undefined) ?? []).join(' ');
+            const family = (official['family'] as string | undefined) ?? '';
+            const fullName = `${given} ${family}`.trim() || 'Unknown';
+            return {
+                status: 'success',
+                practitioner_id: id,
+                name: fullName,
+                qualification: res['qualification'],
+            };
+        } catch (err) {
+            console.error(`tool_get_practitioner_error: ${String(err)}`);
             return { status: 'error', error_message: String(err) };
         }
     },

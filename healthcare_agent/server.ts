@@ -19,7 +19,7 @@ import 'dotenv/config';
 import { createA2aApp } from '../shared/appFactory.js';
 import { rootAgent } from './agent.js';
 
-const PORT = Number(process.env['PORT'] ?? 8001);
+const PORT = Number(process.env['PORT'] ?? 8011);
 const URL = process.env['HEALTHCARE_AGENT_URL'] ?? `http://localhost:${PORT}`;
 
 // Match the Python default: http://localhost:5139/schemas/a2a/v1/fhir-context

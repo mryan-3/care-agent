@@ -2,7 +2,7 @@ services:
   healthcare:
     build: .
     ports:
-      - "8001:8001"
+      - "8011:8001"
     environment:
       - AGENT_MODULE=healthcare_agent
       - PORT=8001
@@ -14,7 +14,7 @@ services:
   general:
     build: .
     ports:
-      - "8002:8002"
+      - "8012:8002"
     environment:
       - AGENT_MODULE=general_agent
       - PORT=8002
@@ -26,7 +26,7 @@ services:
   orchestrator:
     build: .
     ports:
-      - "8003:8003"
+      - "8013:8003"
     environment:
       - AGENT_MODULE=orchestrator
       - PORT=8003
@@ -34,3 +34,59 @@ services:
     env_file:
       - .env
     restart: unless-stopped
+
+  medication_agent:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      - AGENT_MODULE=medication_agent
+      - PORT=8001
+      - GOOGLE_GENAI_USE_VERTEXAI=FALSE
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  scheduling_agent:
+    build: .
+    ports:
+      - "8002:8002"
+    environment:
+      - AGENT_MODULE=scheduling_agent
+      - PORT=8002
+      - GOOGLE_GENAI_USE_VERTEXAI=FALSE
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  care_gap_agent:
+    build: .
+    ports:
+      - "8003:8003"
+    environment:
+      - AGENT_MODULE=care_gap_agent
+      - PORT=8003
+      - GOOGLE_GENAI_USE_VERTEXAI=FALSE
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  care_transition_agent:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - AGENT_MODULE=care_transition_agent
+      - PORT=8000
+      - GOOGLE_GENAI_USE_VERTEXAI=FALSE
+      # In-compose delegation: use service DNS, not localhost
+      - MEDICATION_AGENT_URL=http://medication_agent:8001
+      - SCHEDULING_AGENT_URL=http://scheduling_agent:8002
+      - CARE_GAP_AGENT_URL=http://care_gap_agent:8003
+    env_file:
+      - .env
+    restart: unless-stopped
+    depends_on:
+      - medication_agent
+      - scheduling_agent
+      - care_gap_agent

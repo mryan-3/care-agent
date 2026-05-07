@@ -41,7 +41,15 @@ import express, { Application, Request, Response, NextFunction } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 
 // @google/adk
-import { LlmAgent, InMemorySessionService, Runner, isFinalResponse } from '@google/adk';
+import {
+    LlmAgent,
+    InMemorySessionService,
+    Runner,
+    getFunctionCalls,
+    getFunctionResponses,
+    isFinalResponse,
+    stringifyContent,
+} from '@google/adk';
 
 // @a2a-js/sdk — types
 import { AgentCard, AGENT_CARD_PATH } from '@a2a-js/sdk';
@@ -116,6 +124,11 @@ class AdkAgentExecutor implements AgentExecutor {
         });
     }
 
+    /** Root agent name — used to match final text events that omit content.role. */
+    private get rootAgentName(): string {
+        return this.runner.agent.name;
+    }
+
     async execute(
         requestContext: RequestContext,
         eventBus: ExecutionEventBus,
@@ -157,9 +170,17 @@ class AdkAgentExecutor implements AgentExecutor {
             if (key.includes('fhir-context') && value && typeof value === 'object') {
                 const fhir = value as Record<string, string>;
                 // camelCase — TypeScript convention
-                if (fhir['fhirUrl']) { stateDelta['fhirUrl'] = fhir['fhirUrl']; stateDelta['fhir_url'] = fhir['fhirUrl']; }
-                if (fhir['fhirToken']) { stateDelta['fhirToken'] = fhir['fhirToken']; stateDelta['fhir_token'] = fhir['fhirToken']; }
-                if (fhir['patientId']) { stateDelta['patientId'] = fhir['patientId']; stateDelta['patient_id'] = fhir['patientId']; }
+                if (fhir['fhirUrl'] && fhir['patientId']) {
+                    const fhirUrl = fhir['fhirUrl'];
+                    const patientId = fhir['patientId'];
+                    const fhirToken = fhir['fhirToken'] ?? '';
+                    stateDelta['fhirUrl'] = fhirUrl;
+                    stateDelta['fhir_url'] = fhirUrl;
+                    stateDelta['fhirToken'] = fhirToken;
+                    stateDelta['fhir_token'] = fhirToken;
+                    stateDelta['patientId'] = patientId;
+                    stateDelta['patient_id'] = patientId;
+                }
             }
         }
 
@@ -174,25 +195,63 @@ class AdkAgentExecutor implements AgentExecutor {
             stateDelta,
         });
 
-        let agentText = '';
+        let preferredText = '';
+        let fallbackText = '';
+        let modelError: string | undefined;
+
         for await (const event of eventStream) {
-            // isFinalResponse() returns true on the last model event after all
-            // tool calls have been resolved — this is the text we want to return.
-            if (isFinalResponse(event) && event.content?.role === 'model') {
-                for (const part of event.content.parts ?? []) {
-                    if ('text' in part && typeof part.text === 'string') {
-                        agentText += part.text;
-                    }
-                }
+            if (process.env.DEBUG_ADK === '1') {
+                console.log('[ADK Event]', JSON.stringify(event, null, 2));
+            }
+
+            if (event.errorMessage || event.errorCode) {
+                const parts = [event.errorCode, event.errorMessage].filter(Boolean);
+                modelError = parts.join(': ');
+            }
+
+            if (!isFinalResponse(event)) {
+                continue;
+            }
+
+            // Tool call / tool result envelopes: not user-visible replies. Skipping avoids
+            // treating longRunningToolIds "final" markers or functionResponse rows as answers.
+            if (getFunctionCalls(event).length > 0 || getFunctionResponses(event).length > 0) {
+                continue;
+            }
+
+            const text = stringifyContent(event).trim();
+            if (!text) {
+                continue;
+            }
+
+            const role = event.content?.role;
+            const author = event.author;
+
+            if (role === 'model' || author === this.rootAgentName) {
+                preferredText = text;
+            } else {
+                fallbackText = text;
             }
         }
+
+        const agentText =
+            preferredText ||
+            fallbackText ||
+            (modelError ? `[Model error: ${modelError}]` : '');
 
         // Publish the agent reply back to the A2A caller.
         eventBus.publish({
             kind: 'message',
             messageId: uuidv4(),
             role: 'agent',
-            parts: [{ kind: 'text', text: agentText || '(no response)' }],
+            parts: [
+                {
+                    kind: 'text',
+                    text:
+                        agentText ||
+                        '(no response — check GOOGLE_API_KEY / model access, server logs, or set DEBUG_ADK=1 for event dump)',
+                },
+            ],
             contextId,
         });
 

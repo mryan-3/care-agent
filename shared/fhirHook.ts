@@ -18,9 +18,11 @@
  * Metadata key convention (must match the AgentExtension URI in server.ts):
  *   "http://<host>/schemas/a2a/v1/fhir-context": {
  *     "fhirUrl":   "https://fhir.example.org",
- *     "fhirToken": "<bearer-token>",
+ *     "fhirToken": "<bearer-token or empty string for open sandboxes>",
  *     "patientId": "patient-42"
  *   }
+ *
+ * fhirUrl + patientId are required; fhirToken may be empty (e.g. unauthenticated HAPI).
  */
 
 import type { CallbackContext, LlmRequest } from '@google/adk';
@@ -98,10 +100,11 @@ export function extractFhirContext({
     const fhirToken = (callbackContext.state.get('fhirToken') ?? callbackContext.state.get('fhir_token')) as string | undefined;
     const patientId = (callbackContext.state.get('patientId') ?? callbackContext.state.get('patient_id')) as string | undefined;
 
-    if (fhirUrl && fhirToken && patientId) {
-        writeFhirState(callbackContext.state, fhirUrl, fhirToken, patientId);
+    if (fhirUrl && patientId) {
+        const token = (fhirToken ?? '').trim();
+        writeFhirState(callbackContext.state, fhirUrl, token, patientId);
         console.info(`FHIR_URL_FOUND value=${fhirUrl}`);
-        console.info(`FHIR_TOKEN_FOUND fingerprint=len=${fhirToken.length}`);
+        console.info(`FHIR_TOKEN_FOUND fingerprint=len=${token.length}`);
         console.info(`FHIR_PATIENT_FOUND value=${patientId}`);
         console.info(`hook_called_fhir_found patientId=${patientId}`);
         return undefined;
@@ -116,9 +119,9 @@ export function extractFhirContext({
         const found = scanMetadataForFhir(rawMeta);
         if (found) {
             const url = found['fhirUrl'] ?? '';
-            const token = found['fhirToken'] ?? '';
+            const token = (found['fhirToken'] ?? '').trim();
             const pid = found['patientId'] ?? '';
-            if (url && token && pid) {
+            if (url && pid) {
                 writeFhirState(callbackContext.state, url, token, pid);
                 console.info(`hook_called_fhir_from_metadata patientId=${pid}`);
                 return undefined;

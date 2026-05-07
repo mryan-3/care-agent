@@ -19,7 +19,7 @@ import 'dotenv/config';
 import { createA2aApp } from '../shared/appFactory.js';
 import { rootAgent } from './agent.js';
 
-const PORT = Number(process.env['PORT'] ?? 8002);
+const PORT = Number(process.env['PORT'] ?? 8012);
 const URL = process.env['GENERAL_AGENT_URL'] ?? `http://localhost:${PORT}`;
 
 const app = createA2aApp({

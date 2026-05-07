@@ -23,3 +23,5 @@ npm-debug.log*
 
 # ── AI assistant files ────────────────────────────────────────────────────────
 .claude/
+
+synthea/

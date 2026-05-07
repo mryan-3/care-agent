@@ -19,7 +19,7 @@ import 'dotenv/config';
 import { createA2aApp } from '../shared/appFactory.js';
 import { rootAgent } from './agent.js';
 
-const PORT = Number(process.env['PORT'] ?? 8003);
+const PORT = Number(process.env['PORT'] ?? 8013);
 const URL = process.env['ORCHESTRATOR_URL'] ?? `http://localhost:${PORT}`;
 
 // Same FHIR extension URI as healthcare_agent — the orchestrator passes
