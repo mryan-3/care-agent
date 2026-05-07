@@ -2,7 +2,7 @@ services:
   healthcare:
     build: .
     ports:
-      - "8011:8001"
+      - "8114:8001"
     environment:
       - AGENT_MODULE=healthcare_agent
       - PORT=8001
@@ -14,7 +14,7 @@ services:
   general:
     build: .
     ports:
-      - "8012:8002"
+      - "8115:8002"
     environment:
       - AGENT_MODULE=general_agent
       - PORT=8002
@@ -26,7 +26,7 @@ services:
   orchestrator:
     build: .
     ports:
-      - "8013:8003"
+      - "8116:8003"
     environment:
       - AGENT_MODULE=orchestrator
       - PORT=8003
@@ -38,7 +38,7 @@ services:
   medication_agent:
     build: .
     ports:
-      - "8001:8001"
+      - "8111:8001"
     environment:
       - AGENT_MODULE=medication_agent
       - PORT=8001
@@ -50,7 +50,7 @@ services:
   scheduling_agent:
     build: .
     ports:
-      - "8002:8002"
+      - "8112:8002"
     environment:
       - AGENT_MODULE=scheduling_agent
       - PORT=8002
@@ -62,7 +62,7 @@ services:
   care_gap_agent:
     build: .
     ports:
-      - "8003:8003"
+      - "8113:8003"
     environment:
       - AGENT_MODULE=care_gap_agent
       - PORT=8003
@@ -74,7 +74,7 @@ services:
   care_transition_agent:
     build: .
     ports:
-      - "8000:8000"
+      - "8110:8000"
     environment:
       - AGENT_MODULE=care_transition_agent
       - PORT=8000
